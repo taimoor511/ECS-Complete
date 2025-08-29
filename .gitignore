@@ -1,0 +1,34 @@
+# Ignore Terraform state files and backups
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+.terraform.lock.hcl
+# Local provider and module downloads
+**/.terraform/*
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Ignore tfvars files (likely contain secrets)
+*.tfvars.json
+
+# Ignore override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Ignore CLI config
+.terraformrc
+terraform.rc
+
+# Plan files if you use -out=filename
+*.tfplan
+
+# IDE/editor folders (add as needed)
+.vscode/
+.idea/
+
+# OS-specific
+.DS_Store

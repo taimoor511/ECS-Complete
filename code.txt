@@ -1,0 +1,1521 @@
+I WANT YOU TO WRITE CODE FOR FOLLOWING:
+Right now your root config wires only one task definition + one service, but you want it to be dynamic, so a user can spin up multiple ECS task definitions and services (all in the same existing cluster), with different configurations — without just using count.
+The correct way in Terraform is to:
+Accept a map of task definitions as input (each with its own config).
+For each entry, create:
+Task Definition havin only one container
+Seperate Security Group for each Service
+Service
+Using for_each, not count, since each object may have different attributes.
+====================================================================================================================================================================
+# modules/alb/main.tf
+resource "aws_lb" "this" {
+  name               = var.alb_name
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [var.alb_sg_id]
+  subnets            = var.public_subnets
+
+  ip_address_type = "ipv4"
+
+  tags = merge(
+    {
+      Name = var.alb_name
+    },
+    var.tags
+  )
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.this.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = var.target_group_arn
+  }
+}
+====================================================================================================================================================================
+# modules/alb/output.tf
+output "alb_arn" {
+  description = "ARN of the ALB"
+  value       = aws_lb.this.arn
+}
+
+output "alb_dns_name" {
+  description = "DNS name of the ALB"
+  value       = aws_lb.this.dns_name
+}
+
+output "alb_listener_arn" {
+  description = "ARN of the ALB listener"
+  value       = aws_lb_listener.http.arn
+}
+====================================================================================================================================================================
+# modules/alb/variables.tf
+
+variable "alb_name" {type = string}
+
+variable "alb_sg_id" {type = string}
+
+variable "public_subnets" { type = list(string) }
+
+variable "target_group_arn" { type = string }
+
+variable "tags" {
+  type        = map(string)
+  default     = {}
+}
+====================================================================================================================================================================
+# modules/alb-securitygroup/main.tf
+resource "aws_security_group" "alb_sg" {
+  name        = var.sg_name
+  description = "Security group for ALB"
+  vpc_id      = var.vpc_id
+
+  # Inbound rules
+  ingress {
+    description = "Allow HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Allow HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Allow all TCP"
+    from_port   = 0
+    to_port     = 65535
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Outbound rules (allow all)
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(
+    {
+      Name = var.sg_name
+    },
+    var.tags
+  )
+}
+====================================================================================================================================================================
+# modules/alb-securitygroup/output.tf
+output "alb_sg_id" {
+  description = "The ID of the ALB security group"
+  value       = aws_security_group.alb_sg.id
+}
+====================================================================================================================================================================
+# modules/alb-securitygroup/variables.tf
+variable "sg_name" {
+  description = "Name of the security group"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "VPC ID where the SG will be created"
+  type        = string
+}
+
+variable "tags" {
+  description = "Tags to apply"
+  type        = map(string)
+  default     = {}
+}
+====================================================================================================================================================================
+# modules/ecs-cluster/main.tf
+resource "aws_ecs_cluster" "this" {
+  name = var.cluster_name
+
+  setting {
+    name  = "containerInsights"
+    value = "disabled"
+  }
+
+  tags = merge(
+    {
+      Name = var.cluster_name
+    },
+    var.tags
+  )
+}
+
+# Use Fargate capacity provider
+resource "aws_ecs_cluster_capacity_providers" "this" {
+  cluster_name = aws_ecs_cluster.this.name
+  capacity_providers = ["FARGATE"]
+
+  default_capacity_provider_strategy {
+    capacity_provider = "FARGATE"
+    weight            = 1
+    base              = 1
+  }
+}
+====================================================================================================================================================================
+# modules/ecs-cluster/output.tf
+output "ecs_cluster_id" {
+  description = "ECS Cluster ID"
+  value       = aws_ecs_cluster.this.id
+}
+
+output "ecs_cluster_arn" {
+  description = "ECS Cluster ARN"
+  value       = aws_ecs_cluster.this.arn
+}
+
+output "ecs_cluster_name" {
+  description = "ECS Cluster Name"
+  value       = aws_ecs_cluster.this.name
+}
+====================================================================================================================================================================
+# modules/ecs-cluster/variables.tf
+variable "cluster_name" {
+  description = "ECS cluster name"
+  type        = string
+}
+
+variable "tags" {
+  description = "Tags to apply"
+  type        = map(string)
+  default     = {}
+}
+====================================================================================================================================================================
+# modules/ecs-service/main.tf
+resource "aws_ecs_service" "this" {
+  name            = var.service_name
+  cluster         = var.cluster_id
+  task_definition = var.task_definition_arn
+  launch_type     = "FARGATE"
+  platform_version = "LATEST"
+
+  desired_count       = var.desired_count
+  scheduling_strategy = "REPLICA"
+
+  deployment_controller {
+    type = "ECS"
+  }
+
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 100
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  network_configuration {
+    subnets          = var.private_subnets
+    security_groups  = [var.ecs_service_sg_id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = var.target_group_arn
+    container_name   = var.container_name
+    container_port   = var.container_port
+  }
+
+  tags = merge(
+    {
+      Name = var.service_name
+    },
+    var.tags
+  )
+}
+
+# Auto Scaling Target
+resource "aws_appautoscaling_target" "ecs" {
+  max_capacity       = var.max_count
+  min_capacity       = var.min_count
+  resource_id        = "service/${var.cluster_name}/${aws_ecs_service.this.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+# Auto Scaling Policy
+resource "aws_appautoscaling_policy" "ecs_target" {
+  name               = var.scaling_policy_name
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = var.scaling_metric
+    }
+    target_value       = 70
+    scale_in_cooldown  = 300
+    scale_out_cooldown = 300
+    disable_scale_in   = false
+  }
+}
+====================================================================================================================================================================
+# modules/ecs-service/output.tf:
+output "ecs_service_name" {
+  description = "ECS service name"
+  value       = aws_ecs_service.this.name
+}
+
+output "ecs_service_id" {
+  description = "ECS service ID (also the ARN)"
+  value       = aws_ecs_service.this.id
+}
+
+output "ecs_service_arn" {
+  description = "ECS service ARN (same as ID)"
+  value       = aws_ecs_service.this.id
+}
+====================================================================================================================================================================
+# modules/ecs-service/variables.tf:
+variable "service_name" { type = string }
+variable "cluster_id"   { type = string }
+variable "cluster_name" { type = string }
+
+# Change: pass the task definition ARN instead of family
+variable "task_definition_arn" { type = string }
+
+variable "desired_count" { type = number }
+variable "min_count"     { type = number }
+variable "max_count"     { type = number }
+
+variable "container_name" { type = string }
+variable "container_port" { type = number }
+
+variable "private_subnets" { type = list(string) }
+variable "ecs_service_sg_id" { type = string }
+
+variable "target_group_arn" { type = string }
+
+variable "scaling_policy_name" { type = string }
+variable "scaling_metric" {
+  type    = string
+  default = "ECSServiceAverageCPUUtilization"
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+====================================================================================================================================================================
+# modules/ecs-service-securitygroup/main.tf
+resource "aws_security_group" "ecs_service_sg" {
+  name        = var.sg_name
+  description = "Security group for ECS Services"
+  vpc_id      = var.vpc_id
+
+  # Allow inbound traffic from ALB SG on container port
+  ingress {
+    description     = "Allow inbound traffic from ALB SG to ECS service"
+    from_port       = var.container_port
+    to_port         = var.container_port
+    protocol        = "tcp"
+    security_groups = [var.alb_sg_id]
+  }
+
+  # Allow all outbound traffic
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(
+    {
+      Name = var.sg_name
+    },
+    var.tags
+  )
+}
+====================================================================================================================================================================
+# modules/ecs-service-securitygroup/output.tf:
+output "ecs_service_sg_id" {
+  description = "The ID of the ECS service security group"
+  value       = aws_security_group.ecs_service_sg.id
+}
+====================================================================================================================================================================
+# modules/ecs-service-securitygroup/variable.tf:
+variable "sg_name" {
+  description = "Name of the ECS service security group"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "VPC ID where ECS service SG will be created"
+  type        = string
+}
+
+variable "alb_sg_id" {
+  description = "Security group ID of the ALB"
+  type        = string
+}
+
+variable "container_port" {
+  description = "Container port for ECS service"
+  type        = number
+}
+
+variable "tags" {
+  description = "Tags to apply"
+  type        = map(string)
+  default     = {}
+}
+====================================================================================================================================================================
+# modules/ecs-taskdef/main.tf
+resource "aws_ecs_task_definition" "this" {
+  family                   = var.family
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = var.cpu
+  memory                   = var.memory
+  execution_role_arn       = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/ecsTaskExecutionRole"
+
+  container_definitions = jsonencode([
+    {
+      name      = var.container_name
+      image     = var.container_image
+      essential = true
+
+      portMappings = [
+        {
+          containerPort = var.container_port
+          hostPort      = var.container_port
+          protocol      = "tcp"
+          appProtocol   = "http"
+        }
+      ]
+
+      # Conditional resource limits
+      resourceRequirements = (
+        length(var.gpu) > 0 ?
+        [{ type = "GPU", value = var.gpu }] : []
+      )
+
+      cpu               = var.container_cpu
+      memoryReservation = var.memory_soft_limit
+      memory            = var.memory_hard_limit
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = "/ecs/${var.family}"
+          awslogs-region        = var.region
+          awslogs-stream-prefix = var.container_name
+        }
+      }
+    }
+  ])
+}
+
+data "aws_caller_identity" "current" {}
+
+resource "aws_cloudwatch_log_group" "ecs_task" {
+  name              = "/ecs/${var.family}"
+  retention_in_days = 7
+  tags              = var.tags
+}
+====================================================================================================================================================================
+# modules/ecs-taskdef/output.tf
+output "task_definition_arn" {
+  description = "ARN of the ECS Task Definition"
+  value       = aws_ecs_task_definition.this.arn
+}
+output "task_definition_family" {
+  description = "Task Definition Family"
+  value       = aws_ecs_task_definition.this.family
+}
+output "task_definition_revision" {
+  description = "Revision of the task definition"
+  value       = aws_ecs_task_definition.this.revision
+}
+output "ecs_task_log_group" {
+  value       = aws_cloudwatch_log_group.ecs_task.name
+  description = "CloudWatch Log Group for ECS task"
+}
+====================================================================================================================================================================
+# modules/ecs-taskdef/variables.tf
+variable "family" {
+  description = "Task definition family"
+  type        = string
+}
+
+variable "cpu" {
+  description = "Task-level CPU units"
+  type        = string
+}
+
+variable "memory" {
+  description = "Task-level memory (MB)"
+  type        = string
+}
+
+variable "container_name" {
+  description = "Name of the container"
+  type        = string
+}
+
+variable "container_image" {
+  description = "Image URI of the container"
+  type        = string
+}
+
+variable "container_port" {
+  description = "Port the container listens on"
+  type        = number
+}
+
+variable "container_cpu" {
+  description = "Container-level CPU units"
+  type        = number
+  default     = 0
+}
+
+variable "gpu" {
+  description = "Number of GPUs to allocate to the container"
+  type        = string
+  default     = ""
+}
+
+variable "memory_hard_limit" {
+  description = "Hard memory limit for container (MB)"
+  type        = number
+  default     = 512
+}
+
+variable "memory_soft_limit" {
+  description = "Soft memory limit for container (MB)"
+  type        = number
+  default     = 256
+}
+
+variable "region" {
+  description = "AWS region"
+  type        = string
+}
+
+variable "tags" {
+  description = "Tags to apply to resources"
+  type        = map(string)
+  default     = {}
+}
+====================================================================================================================================================================
+# modules/target-group/main.tf
+resource "aws_lb_target_group" "this" {
+  name        = var.target_group_name
+  port        = 80
+  protocol    = "HTTP"
+  target_type = "ip"
+  vpc_id      = var.vpc_id
+
+  protocol_version = "HTTP1"
+  ip_address_type  = "ipv4"
+
+  health_check {
+    protocol            = "HTTP"
+    port                = "traffic-port"
+    healthy_threshold   = 5
+    unhealthy_threshold = 3
+    timeout             = 50
+    interval            = 60
+    matcher             = "200"
+  }
+
+  tags = merge(
+    {
+      Name = var.target_group_name
+    },
+    var.tags
+  )
+}
+====================================================================================================================================================================
+# modules/target-group/output.tf
+output "target_group_arn" {
+  description = "ARN of the target group"
+  value       = aws_lb_target_group.this.arn
+}
+
+output "target_group_name" {
+  description = "Name of the target group"
+  value       = aws_lb_target_group.this.name
+}
+====================================================================================================================================================================
+# modules/target-group/variables.tf
+variable "target_group_name" {
+  description = "Name of the target group"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "VPC ID where the target group will be created"
+  type        = string
+}
+
+variable "tags" {
+  description = "Tags to apply"
+  type        = map(string)
+  default     = {}
+}
+====================================================================================================================================================================
+# modules/vpc/main.tf
+module "vpc" {
+  source              = "terraform-aws-modules/vpc/aws"
+  version             = "5.5.3"
+  name                = var.name
+  cidr                = var.cidr
+  azs                 = var.azs
+  public_subnets      = var.public_subnets
+  private_subnets     = var.private_subnets
+  enable_dns_support  = var.enable_dns_support
+  enable_dns_hostnames= var.enable_dns_hostnames
+  enable_nat_gateway  = var.enable_nat_gateway
+  single_nat_gateway  = var.single_nat_gateway
+  tags                = var.tags
+}
+====================================================================================================================================================================
+# modules/vpc/output.tf
+output "vpc_id" { value = module.vpc.vpc_id }
+output "public_subnets" { value = module.vpc.public_subnets }
+output "private_subnets" { value = module.vpc.private_subnets }
+====================================================================================================================================================================
+# modules/vpc/variables.tf
+variable "name" { type = string }
+variable "cidr" { type = string }
+variable "azs" { type = list(string) }
+variable "public_subnets" { type = list(string) }
+variable "private_subnets" { type = list(string) }
+variable "enable_dns_support" { type = bool }
+variable "enable_dns_hostnames" { type = bool }
+variable "enable_nat_gateway" { type = bool }
+variable "single_nat_gateway" { type = bool }
+variable "tags" { type = map(string) }
+
+====================================================================================================================================================================
+====================================================================================================================================================================
+====================================================================================================================================================================
+====================================================================================================================================================================
+# (ROOT)main
+module "vpc" {
+  source              = "./modules/vpc"
+  name                = var.vpc_name
+  cidr                = var.vpc_cidr
+  azs                 = var.azs
+  public_subnets      = var.public_subnets
+  private_subnets     = var.private_subnets
+  enable_dns_support  = true
+  enable_dns_hostnames= true
+  enable_nat_gateway  = true
+  single_nat_gateway  = true
+  tags = {
+    Environment = var.environment
+    Owner       = var.owner
+  }
+}
+
+module "alb_sg" {
+  source  = "./modules/alb-securitygroup"
+  sg_name = "alb-sg"
+  vpc_id  = module.vpc.vpc_id
+  tags = {
+    Environment = var.environment
+    Owner       = var.owner
+  }
+}
+
+module "ecs_service_sg" {
+  source         = "./modules/ecs-service-securitygroup"
+  sg_name        = var.ecs_service_sg_name
+  vpc_id         = module.vpc.vpc_id
+  alb_sg_id      = module.alb_sg.alb_sg_id
+  container_port = var.container_port
+  tags = {
+    Environment = var.environment
+    Owner       = var.owner
+  }
+}
+
+module "target_group" {
+  source            = "./modules/target-group"
+  target_group_name = "project-tg"
+  vpc_id            = module.vpc.vpc_id
+  tags = {
+    Environment = var.environment
+    Owner       = var.owner
+  }
+}
+
+module "alb" {
+  source          = "./modules/alb"
+  alb_name        = var.alb_name
+  alb_sg_id       = module.alb_sg.alb_sg_id
+  public_subnets  = module.vpc.public_subnets
+  target_group_arn= module.target_group.target_group_arn
+  tags = {
+    Environment = var.environment
+    Owner       = var.owner
+  }
+}
+
+module "ecs_cluster" {
+  source       = "./modules/ecs-cluster"
+  cluster_name = var.cluster_name
+  tags = {
+    Environment = var.environment
+    Owner       = var.owner
+  }
+}
+
+module "ecs_taskdef" {
+  count           = var.want_to_create_taskdef_and_service ? 1 : 0
+  source          = "./modules/ecs-taskdef"
+  family          = var.task_family
+  cpu             = var.task_cpu
+  memory          = var.task_memory
+  container_name  = var.container_name
+  container_image = var.container_image
+  container_port  = var.container_port
+  container_cpu   = var.container_cpu
+  gpu             = var.gpu
+  memory_hard_limit = var.memory_hard_limit
+  memory_soft_limit = var.memory_soft_limit
+  region          = var.region
+  tags            = var.tags
+}
+
+module "ecs_service" {
+  count           = var.want_to_create_taskdef_and_service ? 1 : 0
+  source             = "./modules/ecs-service"
+  service_name       = var.ecs_service_name
+  cluster_id         = module.ecs_cluster.ecs_cluster_id
+  cluster_name       = module.ecs_cluster.ecs_cluster_name
+
+  # Updated: pass task definition ARN
+  task_definition_arn = module.ecs_taskdef[0].task_definition_arn
+  desired_count      = var.desired_count
+  min_count          = var.min_count
+  max_count          = var.max_count
+
+  container_name     = var.container_name
+  container_port     = var.container_port
+
+  private_subnets    = module.vpc.private_subnets
+  ecs_service_sg_id  = module.ecs_service_sg.ecs_service_sg_id
+
+  target_group_arn   = module.target_group.target_group_arn
+
+  scaling_policy_name = var.scaling_policy_name
+  scaling_metric      = var.scaling_metric
+
+  tags = {
+    Environment = var.environment
+    Owner       = var.owner
+  }
+}
+====================================================================================================================================================================
+# (ROOT)output
+# VPC
+output "vpc_id" { value = module.vpc.vpc_id }
+output "public_subnets" { value = module.vpc.public_subnets }
+output "private_subnets" { value = module.vpc.private_subnets }
+# ALB SG
+output "alb_sg_id" { value = module.alb_sg.alb_sg_id }
+# Target Group
+output "target_group_arn" { value = module.target_group.target_group_arn }
+output "target_group_name" { value = module.target_group.target_group_name }
+# ALB
+output "alb_arn" { value = module.alb.alb_arn }
+output "alb_dns_name" { value = module.alb.alb_dns_name }
+output "alb_listener_arn" { value = module.alb.alb_listener_arn }
+# ECS Cluster
+output "ecs_cluster_id" { value = module.ecs_cluster.ecs_cluster_id }
+output "ecs_cluster_arn" { value = module.ecs_cluster.ecs_cluster_arn }
+output "ecs_cluster_name" { value = module.ecs_cluster.ecs_cluster_name }
+
+# ECS Task Definition outputs
+output "task_definition_arn" {
+  value = try(module.ecs_taskdef[0].task_definition_arn, null)
+}
+output "task_definition_family" {
+  value = try(module.ecs_taskdef[0].task_definition_family, null)
+}
+output "task_definition_revision" {
+  value = try(module.ecs_taskdef[0].task_definition_revision, null)
+}
+output "ecs_task_log_group" {
+  value = try(module.ecs_taskdef[0].ecs_task_log_group, null)
+}
+
+# ECS Service outputs
+output "ecs_service_name" {
+  value = try(module.ecs_service[0].ecs_service_name, null)
+}
+output "ecs_service_id" {
+  value = try(module.ecs_service[0].ecs_service_id, null)
+}
+output "ecs_service_arn" {
+  value = try(module.ecs_service[0].ecs_service_arn, null)
+}
+====================================================================================================================================================================
+# (ROOT)provider
+terraform {
+  required_version = ">= 1.7.0"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+  }
+}
+
+provider "aws" {
+  region = var.region
+}
+====================================================================================================================================================================
+# (ROOT)terraform.tfvars
+# VPC
+region          = "us-east-1"
+vpc_name        = "project-vpc"
+vpc_cidr        = "10.0.0.0/16"
+azs             = ["us-east-1a", "us-east-1b"]
+public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnets = ["10.0.3.0/24", "10.0.4.0/24"]
+
+# Security Group
+sg_name         = "project-alb-sg"
+# ECS Service SG
+ecs_service_sg_name = "project-ecs-service-sg"
+
+# Target Group
+target_group_name = "project-tg"
+
+# ALB
+alb_name = "project-alb"
+
+# ECS Cluster
+cluster_name = "project-cluster"
+
+# wether you want to create taskdefination and service or not
+want_to_create_taskdef_and_service = true
+
+# ECS Task Definition
+task_family        = "project-task"
+task_cpu           = "256" # 1024 CPU units = 1 vCPU.
+task_memory        = "512" # task memory/ram  in MB
+
+container_name     = "project-app"
+container_image    = "084828600005.dkr.ecr.us-east-1.amazonaws.com/taimoor/project:latest" #image latest url
+container_port     = 5000 # port on which container is running
+container_cpu      = 128 # 1024 CPU units = 1 vCPU.
+gpu                = ""
+memory_hard_limit  = 512 #  container memory/ram  in MB
+memory_soft_limit  = 256 #  container memory/ram  in MB
+
+# ECS Service
+ecs_service_name    = "project-service"
+desired_count       = 2
+min_count           = 1
+max_count           = 4
+scaling_policy_name = "project-scaling-policy"
+scaling_metric      = "ECSServiceAverageCPUUtilization" # "ECSServiceAverageCPUUtilization" or "ECSServiceAverageMemoryUtilization"
+
+
+# environment
+environment     = "development"
+owner           = "devops-team"
+====================================================================================================================================================================
+# (ROOT)variables.tf
+# VPC
+variable "region" { type = string }
+variable "vpc_name" { type = string }
+variable "vpc_cidr" { type = string }
+variable "azs" { type = list(string) }
+variable "public_subnets" { type = list(string) }
+variable "private_subnets" { type = list(string) }
+# ALB SG
+variable "sg_name" { type = string}
+# Target Group
+variable "target_group_name" { type = string }
+# ALB
+variable "alb_name" { type = string }
+# CLUSTER NAME
+variable "cluster_name" { type = string}
+# wether you want to create taskdefination and service or not
+variable "want_to_create_taskdef_and_service" {
+  type = bool 
+  default = true 
+}
+# ECS Task Definition
+variable "task_family" { type = string }
+variable "task_cpu" { type = string }
+variable "task_memory" { type = string }
+variable "container_name" { type = string }
+variable "container_image" { type = string }
+variable "container_port" { type = number }
+variable "container_cpu" { type = number }
+variable "gpu" { type = string }
+variable "memory_hard_limit" { type = number }
+variable "memory_soft_limit" { type = number }
+# ECS Service SG
+variable "ecs_service_sg_name" { type = string }
+# ECS Service
+variable "ecs_service_name" { type = string }
+variable "desired_count"    { type = number }
+variable "min_count"        { type = number }
+variable "max_count"        { type = number }
+variable "scaling_policy_name" { type = string }
+variable "scaling_metric" {
+  type    = string
+  default = "ECSServiceAverageCPUUtilization"
+}
+
+
+# Env + Tags
+variable "environment" { type = string }
+variable "owner" { type = string }
+
+variable "tags" {
+  description = "Tags to apply to all resources"
+  type        = map(string)
+  default     = {}
+}
+====================================================================================================================================================================
+
+IF:
+# is Hosted Zone on AWS
+is_hosted_zone_on_aw=true
+# Toggle whether to /use/create: ACM + Route53
+create_acm = true
+i want yout to 
+create aws_acm_certificate and aws_route53_record and also create aws_lb_listener and aws_route53_record pointing to ALB DNS 
+ELSE IF:
+# is Hosted Zone on AWS
+is_hosted_zone_on_aw=true
+# Toggle whether to use/create: ACM + Route53 
+create_acm = false
+i want yout to 
+use exsisting  aws_acm_certificate and also create aws_lb_listener and aws_route53_record pointing to ALB DNS 
+ELSE:
+is_hosted_zone_on_aw= false
+skip these create aws_acm_certificate and aws_route53_record and also create aws_lb_listener and aws_route53_record pointing to ALB DNS 
+no matter 
+create_acm = false or true
+======
+ROOT main.tf:
+module "acm" {
+  source         = "./modules/acm"
+  domain_name    = var.domain_name
+  hosted_zone_id = var.hosted_zone_id
+  environment    = var.environment
+  owner          = var.owner
+  tags           = var.tags
+  create_acm     = var.create_acm  # NEW
+}
+
+module "https_listener" {
+  source                  = "./modules/listener"
+  alb_arn                 = module.alb.alb_arn
+  target_group_arn        = module.target_group.target_group_arn
+  certificate_arn         = module.acm.certificate_arn 
+  https_domain            = var.https_domain
+  hosted_zone_id          = var.hosted_zone_id
+  alb_dns_name            = module.alb.alb_dns_name
+  alb_zone_id             = module.alb.alb_zone_id
+}
+====
+ROOT variables.tf:
+#ROOT(variables.tf)
+# VPC
+variable "region" { type = string }
+variable "vpc_name" { type = string }
+variable "vpc_cidr" { type = string }
+variable "azs" { type = list(string) }
+variable "public_subnets" { type = list(string) }
+variable "private_subnets" { type = list(string) }
+
+# ALB SG
+variable "sg_name" { type = string }
+
+# Target Group
+variable "target_group_name" { type = string }
+
+variable "health_check_path" {
+  type        = string
+  default     = "/"
+}
+variable "health_check_matcher" {
+  type        = string
+  default     = "200"
+}
+variable "health_check_port" {
+  type        = string
+  default     = "traffic-port"
+}
+variable "health_check_interval" {
+  type        = number
+  default     = 30
+}
+variable "health_check_timeout" {
+  type        = number
+  default     = 5
+}
+variable "healthy_threshold" {
+  type        = number
+  default     = 5
+}
+variable "unhealthy_threshold" {
+  type        = number
+  default     = 3
+}
+# ALB
+variable "alb_name" { type = string }
+
+# ECS Cluster
+variable "cluster_name" { type = string }
+
+# whether you want to create taskdefination and service or not
+variable "want_to_create_taskdef_and_service" {
+  type    = bool
+  default = true
+}
+
+# ECS Task Definition
+variable "task_family" { type = string }
+variable "task_cpu"    { type = string }
+variable "task_memory" { type = string }
+
+variable "containers" {
+  description = <<EOT
+List of container definitions.
+Each object should have:
+  - name
+  - image
+  - port
+  - cpu
+  - gpu
+  - memory_hard_limit
+  - memory_soft_limit
+  - essential
+  - environment (list of { name, value })
+  - dependencies (list of { containerName, condition })
+EOT
+  type = list(object({
+    name               = string
+    image              = string
+    port               = number
+    cpu                = number
+    gpu                = string
+    memory_hard_limit  = number
+    memory_soft_limit  = number
+    essential          = bool
+    environment        = list(object({ name = string, value = string }))
+    dependencies       = list(object({ containerName = string, condition = string }))
+    health_check       = optional(object({
+      command     = list(string)
+      interval    = number
+      retries     = number
+      startPeriod = number
+      timeout     = number
+    }), null)
+  }))
+}
+
+# ECS Service SG
+variable "ecs_service_sg_name" { type = string }
+
+# ECS Service
+variable "ecs_service_name" { type = string }
+variable "desired_count"    { type = number }
+variable "min_count"        { type = number }
+variable "max_count"        { type = number }
+variable "scaling_policy_name" { type = string }
+variable "scaling_metrics" {
+  type        = list(string)
+  default     = ["ECSServiceAverageCPUUtilization"]
+}
+
+
+# Which container is behind ALB
+variable "load_balanced_container_name" { type = string }
+variable "load_balanced_container_port" { type = number }
+
+# Env + Tags
+variable "environment" { type = string }
+variable "owner"       { type = string }
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+# ACM Certificate
+variable "create_acm" {
+  type        = bool
+  default     = true
+}
+variable "domain_name" { type = string }
+variable "hosted_zone_id" { type = string}
+# HTTPS Listner
+
+variable "https_domain" {
+  description = "Domain name to use in HTTPS listener Host Header and Route53 record"
+  type        = string
+  default     = "backend.taimoor.site"
+}
+====
+ROOT output,tf:
+# (ROOT)output
+# VPC
+output "vpc_id" { value = module.vpc.vpc_id }
+output "public_subnets" { value = module.vpc.public_subnets }
+output "private_subnets" { value = module.vpc.private_subnets }
+# ALB SG
+output "alb_sg_id" { value = module.alb_sg.alb_sg_id }
+# Target Group
+output "target_group_arn" { value = module.target_group.target_group_arn }
+output "target_group_name" { value = module.target_group.target_group_name }
+# ALB
+output "alb_arn" { value = module.alb.alb_arn }
+output "alb_dns_name" { value = module.alb.alb_dns_name }
+output "alb_listener_arn" { value = module.alb.alb_listener_arn }
+# ECS Cluster
+output "ecs_cluster_id" { value = module.ecs_cluster.ecs_cluster_id }
+output "ecs_cluster_arn" { value = module.ecs_cluster.ecs_cluster_arn }
+output "ecs_cluster_name" { value = module.ecs_cluster.ecs_cluster_name }
+
+# ECS Task Definition outputs
+output "task_definition_arn" {
+  value = try(module.ecs_taskdef[0].task_definition_arn, null)
+}
+output "task_definition_family" {
+  value = try(module.ecs_taskdef[0].task_definition_family, null)
+}
+output "task_definition_revision" {
+  value = try(module.ecs_taskdef[0].task_definition_revision, null)
+}
+output "ecs_task_log_group" {
+  value = try(module.ecs_taskdef[0].ecs_task_log_group, null)
+}
+
+# ECS Service outputs
+output "ecs_service_name" {
+  value = try(module.ecs_service[0].ecs_service_name, null)
+}
+output "ecs_service_id" {
+  value = try(module.ecs_service[0].ecs_service_id, null)
+}
+output "ecs_service_arn" {
+  value = try(module.ecs_service[0].ecs_service_arn, null)
+}
+
+# ACM Certificate
+output "acm_certificate_arn" {
+  value = module.acm.certificate_arn
+}
+output "acm_certificate_domain" {
+  value = module.acm.certificate_domain
+}
+output "acm_certificate_validation_status" {
+  value = module.acm.certificate_validation_status
+}
+====
+terraform.tfvars:
+#ROOT(terraform.tfvars)
+#######################################
+# DEFAULT
+#######################################
+
+# Toggle whether to create: task definition + ECS service  +ACM + HTTPS listner
+want_to_create_taskdef_and_service = true
+# is Hosted Zone on AWS
+is_hosted_zone_on_aw=true
+# Toggle whether to create: ACM + Route53 creation
+create_acm = true
+
+#######################################
+# VPC CONFIGURATION
+#######################################
+
+# AWS region to deploy resources
+region = "us-east-1"
+
+# Name for the VPC
+vpc_name = "project-vpc"
+
+# VPC CIDR block (IP range)
+vpc_cidr = "10.0.0.0/16"
+
+# Availability Zones to use (make sure these exist in your region)
+azs = ["us-east-1a", "us-east-1b"]
+
+# Public subnets (used for load balancer, NAT gateway, etc.)
+public_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
+
+# Private subnets (used for ECS tasks/services)
+private_subnets = ["10.0.3.0/24", "10.0.4.0/24"]
+
+
+#######################################
+# SECURITY GROUPS
+#######################################
+
+# Security group for the Application Load Balancer
+sg_name = "project-alb-sg"
+
+# Security group for ECS service tasks
+ecs_service_sg_name = "project-ecs-service-sg"
+
+
+#######################################
+# LOAD BALANCER + TARGET GROUP
+#######################################
+
+# Name of Application Load Balancer (ALB)
+alb_name = "project-alb"
+
+# Name of Target Group for routing traffic to ECS service
+target_group_name = "project-tg"
+health_check_path     = "/health"
+health_check_matcher  = "200"
+
+#######################################
+# ECS CLUSTER
+#######################################
+
+# ECS Cluster name
+cluster_name = "project-cluster"
+
+#######################################
+# ECS TASK DEFINITION
+#######################################
+
+# Family name (identifier) for ECS task definition
+task_family = "project-task"
+
+# Task-level CPU and Memory (applies to the whole task)
+# Must follow valid Fargate combinations (e.g. 512/1024/2048 CPU with 1–30 GB memory)
+task_cpu    = "1024"   # 256 → 0.25 vCPU
+task_memory = "2048"  # 512mb → 0.5 GB RAM
+
+# Containers inside the ECS task
+# Each container can define its own CPU, memory, ports, environment variables, dependencies, etc.
+containers = [
+
+  ###################################
+  # Redis Container
+  ###################################
+  {
+    name              = "redis"             # Container name
+    image             = "redis:alpine"      # Docker image
+    port              = 6379                # Exposed port
+    cpu               = 256                 # CPU units (share of task CPU)
+    gpu               = ""                  # Leave empty unless using GPU instances
+    memory_hard_limit = 512                 # Max memory (container will be killed if exceeded)
+    memory_soft_limit = 256                 # Reserved memory (guaranteed)
+    essential         = true                # Task fails if this container fails
+    environment       = []                  # No custom env vars
+    dependencies      = []                  # No startup dependencies
+    health_check = {                        # ECS health check
+      command     = ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval    = 30
+      retries     = 3
+      startPeriod = 10
+      timeout     = 5
+    }
+  },
+
+  ###################################
+  # MongoDB Container
+  ###################################
+  {
+    name              = "mongo"
+    image             = "mongo:latest"
+    port              = 27017
+    cpu               = 256
+    gpu               = ""
+    memory_hard_limit = 512
+    memory_soft_limit = 256
+    essential         = true
+    environment       = [                   # MongoDB requires root credentials
+      { name = "MONGO_INITDB_ROOT_USERNAME", value = "root" },
+      { name = "MONGO_INITDB_ROOT_PASSWORD", value = "example" }
+    ]
+    dependencies      = []
+    health_check = {
+      command     = ["CMD-SHELL", "mongosh --username root --password example --eval \"db.adminCommand('ping')\" || exit 1"]
+      interval    = 30
+      retries     = 3
+      startPeriod = 20
+      timeout     = 5
+    }
+  },
+
+  ###################################
+  # Application Container
+  ###################################
+  {
+    name              = "project-app"
+    image             = "084828600005.dkr.ecr.us-east-1.amazonaws.com/taimoor/project:latest" # Replace with your ECR image
+    port              = 5000
+    cpu               = 256
+    gpu               = ""
+    memory_hard_limit = 512
+    memory_soft_limit = 256
+    essential         = true
+    environment = [                               # Application environment variables
+      { name = "PORT", value = "5000" },
+      { name = "MONGODB_URI", value = "mongodb://root:example@127.0.0.1:27017/taimoor?authSource=admin" },
+      { name = "REDIS_URL", value = "redis://127.0.0.1:6379" }
+    ]
+    dependencies = [                              # Start app only after DB + Cache are healthy
+      { containerName = "redis", condition = "HEALTHY" },
+      { containerName = "mongo", condition = "HEALTHY" }
+    ]
+    # Optional: Add health check for your app (uncomment and modify if needed)
+    health_check = null
+  }
+]
+
+#######################################
+# ECS SERVICE CONFIGURATION
+#######################################
+
+# Name of the ECS Service
+ecs_service_name = "project-service"
+
+# Desired number of running tasks (can scale between min and max)
+desired_count = 1
+min_count     = 1
+max_count     = 2
+
+# Auto-scaling policy
+scaling_policy_name = "project-scaling-policy"
+
+# Choose scaling metric: "ECSServiceAverageCPUUtilization" or "ECSServiceAverageMemoryUtilization"
+scaling_metrics = ["ECSServiceAverageCPUUtilization", "ECSServiceAverageMemoryUtilization"]
+# Container that should be attached to the ALB (your app container)
+load_balanced_container_name = "project-app"
+load_balanced_container_port = 5000
+
+#######################################
+# ACM CERTIFICATE
+#######################################
+
+# Your domain (must already exist in Route53)
+domain_name   = "*.taimoor.site"
+# Hosted zone ID for the domain in Route53
+hosted_zone_id = "Z0700718GCRWXN5WH2MS"
+
+#######################################
+# HTTPS LISTNER
+#######################################
+
+https_domain          = "backend.taimoor.site"
+
+#######################################
+# TAGGING (for cost allocation & ownership)
+#######################################
+
+environment = "development"   # e.g. dev / staging / prod
+owner       = "devops-team"   # Who owns this infra
+====
+# modules/acm/main.tf
+#########################################
+# ACM Certificate (conditionally created)
+#########################################
+# Create ACM certificate (only if create_acm = true)
+resource "aws_acm_certificate" "this" {
+  count  = var.create_acm ? 1 : 0
+  domain_name       = var.domain_name
+  validation_method = "DNS"
+
+  # Only apply prevent_destroy when we are NOT creating
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+#########################################
+# DNS validation record (only if creating cert)
+#########################################
+resource "aws_route53_record" "validation" {
+  count = var.create_acm ? length(tolist(aws_acm_certificate.this[0].domain_validation_options)) : 0
+
+  zone_id = var.hosted_zone_id
+  name    = tolist(aws_acm_certificate.this[0].domain_validation_options)[count.index].resource_record_name
+  type    = tolist(aws_acm_certificate.this[0].domain_validation_options)[count.index].resource_record_type
+  records = [tolist(aws_acm_certificate.this[0].domain_validation_options)[count.index].resource_record_value]
+  ttl     = 60
+}
+
+#########################################
+# Certificate validation (only if creating cert)
+#########################################
+resource "aws_acm_certificate_validation" "this" {
+  count = var.create_acm ? 1 : 0
+
+  certificate_arn         = aws_acm_certificate.this[0].arn
+  validation_record_fqdns = [for record in aws_route53_record.validation : record.fqdn]
+}
+
+#########################################
+# Lookup existing ACM cert (only if create_acm = false)
+#########################################
+data "aws_acm_certificate" "existing" {
+  count  = var.create_acm ? 0 : 1
+  domain   = var.domain_name
+  statuses = ["ISSUED"]
+
+  # When using data sources, nothing is destroyed anyway
+}
+====
+# modules/acm/main.tf
+output "certificate_domain" {
+  description = "Domain name of the ACM certificate"
+  value       = var.create_acm ? try(aws_acm_certificate.this[0].domain_name, null) : try(data.aws_acm_certificate.existing[0].domain, null)
+}
+output "certificate_validation_status" {
+  description = "Validation status of the ACM certificate (null if using existing)"
+  value       = var.create_acm ? try(aws_acm_certificate.this[0].status, null) : "EXISTING"
+}
+output "certificate_arn" {
+  value = var.create_acm ? aws_acm_certificate.this[0].arn : data.aws_acm_certificate.existing[0].arn
+}
+====
+# modules/acm/main.tf
+variable "create_acm" {
+  type    = bool
+  default = false
+}
+
+variable "domain_name" {
+  type        = string
+  description = "The domain name for the ACM certificate"
+}
+
+variable "hosted_zone_id" {
+  description = "Route53 Hosted Zone ID for domain validation"
+  type        = string
+}
+
+variable "environment" {
+  description = "Environment tag (e.g., dev, staging, prod)"
+  type        = string
+}
+
+variable "owner" {
+  description = "Owner tag"
+  type        = string
+}
+
+variable "tags" {
+  description = "Additional tags"
+  type        = map(string)
+  default     = {}
+}
+====
+# modules/listener/main.tf
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = var.alb_arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = var.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = var.target_group_arn
+    order            = 1
+  }
+}
+
+# Optional: Add host header rule
+resource "aws_lb_listener_rule" "https_host_header" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 1
+
+  action {
+    type             = "forward"
+    target_group_arn = var.target_group_arn
+  }
+
+  condition {
+    host_header {
+      values = [var.https_domain]
+    }
+  }
+}
+
+# Optional Route53 Record pointing domain to ALB DNS
+resource "aws_route53_record" "https_record" {
+  zone_id = var.hosted_zone_id
+  name    = var.https_domain
+  type    = "A"
+
+  alias {
+    name                   = var.alb_dns_name
+    zone_id                = var.alb_zone_id
+    evaluate_target_health = true
+  }
+}
+=====
+# modules/listener/output.tf
+output "https_listener_arn" {
+  value = try(aws_lb_listener.https.arn, null)
+}
+
+output "https_listener_rule_arn" {
+  value = try(aws_lb_listener_rule.https_host_header.arn, null)
+}
+
+output "https_record_fqdn" {
+  value = try(aws_route53_record.https_record.fqdn, null)
+}
+====
+# modules/listener/variables.tf
+
+variable "alb_arn" {
+  description = "ARN of the ALB to attach the HTTPS listener"
+  type        = string
+}
+
+variable "target_group_arn" {
+  description = "ARN of the target group to forward requests"
+  type        = string
+}
+
+variable "certificate_arn" {
+  description = "ARN of the ACM certificate for HTTPS listener"
+  type        = string
+}
+
+variable "https_domain" {
+  description = "Domain name to use in HTTPS listener Host Header and Route53 record"
+  type        = string
+}
+
+variable "hosted_zone_id" {
+  description = "Route53 hosted zone ID for creating the DNS record"
+  type        = string
+}
+
+variable "alb_dns_name" {
+  description = "DNS name of the ALB, used for Route53 record"
+  type        = string
+}
+
+variable "alb_zone_id" {
+  description = "ALB hosted zone ID, used for Route53 record"
+  type        = string
+}
+====
+
