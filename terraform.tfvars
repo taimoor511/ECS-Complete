@@ -6,6 +6,7 @@
 #######################################
 
 # Toggle whether to create: task definition + ECS service  +ACM + HTTPS listner
+# NOTE: If want_to_create_taskdef_and_service is set to false, then manually set both `is_hosted_zone_on_aws` and `create_acm` to false
 want_to_create_taskdef_and_service = true
 # is Hosted Zone on AWS
 is_hosted_zone_on_aws=true
